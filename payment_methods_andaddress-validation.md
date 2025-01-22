@@ -1,4 +1,4 @@
-# Work Plan for Payment Methods and Checkout Enhancements
+# Work Plan for Payment Methods and Address Validation
 
 ## For Tolu(Backend)
 
