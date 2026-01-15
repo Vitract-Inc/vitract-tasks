@@ -266,6 +266,167 @@ This removes ambiguity and prevents incorrect manual actions.
 * No duplicate visibility records are created
 * No support intervention required for expected workflows
 
+---
+
+## 13. Conditional Client Identity Collection (Delivery Mode–Aware)
+
+### Background
+
+During practitioner order creation, client identity fields were previously collected unconditionally. This does not align with real-world **Kit On-Site** workflows, where kits are shipped to clinics and later handed to patients whose identities are not yet known.
+
+To prevent invalid data capture, confusion, and downstream inconsistencies, client identity collection must now be **explicitly tied to delivery mode**.
+
+---
+
+### Delivery Mode Rules
+
+#### Kit On-Site (`deliveryMode = ON_SITE`)
+
+When **Kit On-Site** is selected:
+
+* Client **first name**, **last name**, and **email** must **not** be collected
+* These fields must be:
+
+  * Hidden in the UI
+  * Optional at the DTO level
+  * Persisted as `NULL` / `undefined` in the database
+* Empty strings submitted from the frontend must be transformed to `undefined`
+
+Rationale:
+Kits are not associated with a specific client at order time. Client assignment occurs later during manual or client-driven registration.
+
+---
+
+#### Dropship (`deliveryMode = DROPSHIP`)
+
+When **Dropship** is selected:
+
+* Client **first name**, **last name**, and **email** are **required**
+* These fields must:
+
+  * Be visible in the UI
+  * Be strictly validated (non-empty, non-null)
+  * Be rejected if missing or invalid
+
+Rationale:
+Dropship orders are shipped directly to a known client and rely on client identity for fulfillment and downstream automation.
+
+---
+
+### Backend Validation Requirements
+
+Validation must be enforced at **multiple layers** to ensure correctness and fail fast:
+
+#### DTO-Level Validation
+
+* Client identity fields (`firstName`, `lastName`, `email`) are:
+
+  * Required **only if** `deliveryMode !== ON_SITE`
+  * Optional **only if** `deliveryMode === ON_SITE`
+* Payload transformation must convert empty strings to `undefined` before validation
+
+This prevents accidental persistence of invalid placeholder values.
+
+---
+
+#### Service-Level Guardrails
+
+In addition to DTO validation, **order creation services must explicitly enforce delivery mode rules**:
+
+* If `deliveryMode === DROPSHIP`:
+
+  * Reject orders missing client first name, last name, or email
+* If `deliveryMode === ON_SITE`:
+
+  * Ignore client identity fields entirely
+  * Do not persist them on the `orders` table
+
+This ensures protection against:
+
+* Bypassed DTO validation
+* Programmatic misuse
+* Future regressions
+
+---
+
+### Data Persistence Rules
+
+On the `orders` table:
+
+* For **Kit On-Site** orders:
+
+  * Client identity fields must remain `NULL`
+* For **Dropship** orders:
+
+  * Client identity fields must be fully populated and valid
+
+This maintains data integrity and aligns storage with real-world intent.
+
+---
+
+### Outcome
+
+This update ensures:
+
+* No premature or invalid client data is collected
+* Order intent is unambiguous
+* Dropship automation remains reliable
+* On-site clinic workflows remain clean and flexible
+* Backend enforcement matches UI behavior
+* Support and audit complexity is reduced
+
+
+### DTO Enforcement Example (Illustrative)
+
+The order creation DTO must enforce conditional client identity validation based on `deliveryMode`.
+
+```ts
+export enum DeliveryMode {
+  DROPSHIP = 'dropship',
+  ON_SITE = 'on_site',
+}
+
+const emptyStringToUndefined = ({ value }: { value: unknown }) =>
+  typeof value === 'string' && value.trim() === '' ? undefined : value;
+
+  @ApiPropertyOptional({ enum: DeliveryMode })
+  @IsEnum(DeliveryMode)
+  @IsOptional()
+  deliveryMode?: DeliveryMode;
+
+  @ApiPropertyOptional()
+  @Transform(emptyStringToUndefined)
+  @ValidateIf((o) => o.deliveryMode !== DeliveryMode.ON_SITE)
+  @IsString()
+  @IsNotEmpty()
+  firstName?: string;
+
+  @ApiPropertyOptional()
+  @Transform(emptyStringToUndefined)
+  @ValidateIf((o) => o.deliveryMode !== DeliveryMode.ON_SITE)
+  @IsString()
+  @IsNotEmpty()
+  lastName?: string;
+
+  @ApiPropertyOptional()
+  @Transform(emptyStringToUndefined)
+  @ValidateIf((o) => o.deliveryMode !== DeliveryMode.ON_SITE)
+  @IsEmail()
+  @IsNotEmpty()
+  email?: string;
+```
+
+
+### Enforcement Notes
+
+* DTO validation **does not replace** service-level checks
+* Order creation services must still explicitly enforce:
+
+  * Client identity is **required** for `DROPSHIP`
+  * Client identity is **ignored** for `ON_SITE`
+
+This layered approach guarantees correctness even if validation is bypassed.
+
 
 ## Implementation Checklist (Engineering)
 
@@ -318,3 +479,5 @@ This removes ambiguity and prevents incorrect manual actions.
 13. Rename practitioner side navigation item to **Register On-Site Kits** and add clarifying copy.
 
 14. Ensure all flows are idempotent and log auto-grant events for traceability.
+
+15. Enforce delivery-mode–aware client identity handling by requiring client name and email only for DROPSHIP orders and omitting them entirely for ON-SITE orders, with UI hiding/clearing, DTO-level transform + conditional validation, and service-level guards to prevent invalid persistence.
