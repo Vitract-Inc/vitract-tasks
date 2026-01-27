@@ -870,7 +870,6 @@ Acceptance:
 * [ ] E2E tests exist (optional) and are deterministic
 * [ ] Coverage threshold enforced with a ratchet plan
 
-````
 
 # Implementation Appendix (Detailed, Step-by-step)
 
@@ -899,7 +898,7 @@ DATABASE_NAME=vitract_kit_test
 REDIS_HOST=127.0.0.1
 REDIS_PORT=16379
 REDIS_PASSWORD=
-````
+
 
 ### A3) Add docs to README (or `docs/testing.md`)
 
@@ -1335,8 +1334,3 @@ Testing becomes:
 * [ ] 3–5 integration tests (migrations + mail tx + 1–2 HTTP flows)
 * [ ] CI runs unit + integration on PR
 * [ ] initial coverage thresholds enforced + ratchet plan documented
-
-```
-
-If you want, I can also generate an **Augment execution prompt** that tells it exactly which files to touch (≤12–15) to implement **Phase 1 foundations** with minimal drift (docker-compose.test.yml + helpers + scripts + scheduler flag).
-```
