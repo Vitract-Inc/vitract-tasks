@@ -1,13 +1,3 @@
-Got it. Here’s the clean, **fully correct** way to implement your “industry” control with your real org setup:
-
-* **Team**: `Vitract Server` (ultimate reviewer group)
-* **Kahmyl** usually opens PRs and **cannot self-approve/merge** because branch protection requires at least one reviewer.
-* You still want the **diff-based destructive migration guard** + **explicit marker** + **human approval**.
-
-Below is the updated runbook with those facts baked in.
-
----
-
 # Runbook: Destructive Migration Guard + Team Review Enforcement (Vitract Server)
 
 ## Objective
