@@ -131,7 +131,6 @@ db.ts
 queues.ts
 fixtures.ts
 
-````
 
 ### 3.3 Naming
 - Unit: `*.spec.ts`
@@ -215,7 +214,7 @@ services:
       interval: 5s
       timeout: 3s
       retries: 30
-````
+```
 
 ### 5.2 Local developer workflow
 
