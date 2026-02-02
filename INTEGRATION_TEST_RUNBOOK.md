@@ -46,25 +46,49 @@ Verifies multi-component behavior with a **real MSSQL database**:
 ## Folder Layout
 
 ````
-test/
-integration/
-payment/
-kit/
-reporting/
-user/
-factories/
-setup/
-database-template.ts
-database-cleanup.ts
-TestAppModule.ts
-create-test-app.ts
-test-hooks.ts
-global-setup.ts
-global-teardown.ts
-jest.integration.config.js
-
-docker-compose.test.yml
-.env.test.example
+.
+├── docker-compose.test.yml
+├── .env.test.example
+│
+├── test/
+│   │
+│   ├── integration/
+│   │   │
+│   │   ├── payment/
+│   │   │   ├── base-order.service.spec.ts
+│   │   │   ├── payment-retry.service.spec.ts
+│   │   │   └── reconcile-statements.service.spec.ts
+│   │   │
+│   │   ├── kit/
+│   │   │   ├── register-kit.service.spec.ts
+│   │   │   └── auto-register.processor.spec.ts
+│   │   │
+│   │   ├── reporting/
+│   │   │   ├── transaction-reporting.service.spec.ts
+│   │   │   └── order-reporting.service.spec.ts
+│   │   │
+│   │   └── user/
+│   │       └── create-user.service.spec.ts
+│   │
+│   ├── factories/
+│   │   ├── user.factory.ts
+│   │   ├── order.factory.ts
+│   │   ├── kit.factory.ts
+│   │   ├── payment.factory.ts
+│   │   └── practitioner.factory.ts
+│   │
+│   ├── setup/
+│   │   ├── database-template.ts      # create template DB + restore per worker
+│   │   ├── database-cleanup.ts       # disable FK → truncate → re-enable
+│   │   ├── TestAppModule.ts           # test-only Nest module (no Bull/Redis)
+│   │   ├── create-test-app.ts         # bootstrap app + mock externals + queues
+│   │   ├── test-hooks.ts              # per-worker DB restore (lock-file)
+│   │   ├── global-setup.ts            # Jest globalSetup (template DB + backup)
+│   │   └── global-teardown.ts         # Jest globalTeardown (drop test DBs)
+│   │
+│   └── jest.integration.config.js
+│
+└── package.json
 
 ````
 
