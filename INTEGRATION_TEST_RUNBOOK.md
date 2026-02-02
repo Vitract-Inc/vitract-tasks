@@ -45,6 +45,7 @@ Verifies multi-component behavior with a **real MSSQL database**:
 
 ## Folder Layout
 
+```
 ├── docker-compose.test.yml
 ├── .env.test.example
 │
@@ -87,6 +88,7 @@ Verifies multi-component behavior with a **real MSSQL database**:
 │   └── jest.integration.config.js
 │
 └── package.json
+```
 
 ---
 
