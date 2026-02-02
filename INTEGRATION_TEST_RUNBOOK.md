@@ -1,11 +1,4 @@
 # Integration Test Setup Runbook
-
-**File:** `docs/testing/INTEGRATION_TEST_RUNBOOK.md`  
-**System:** NestJS + TypeORM + Microsoft SQL Server  
-**Audience:** Staff / Principal Engineers  
-**Status:** Production-grade standard  
-**Last Updated:** 2026-02-02  
-
 ---
 
 ## Goals
