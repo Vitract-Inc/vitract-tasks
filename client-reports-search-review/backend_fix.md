@@ -1,4 +1,4 @@
-# 📘 Practitioner Kit Search — Enterprise Full-Text Search Upgrade (MSSQL)**
+# 📘 Practitioner Kit Search — Enterprise Full-Text Search Upgrade (MSSQL)
 
 
 # 1. Executive Summary
