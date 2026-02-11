@@ -114,36 +114,6 @@ Scenarios covered:
 - page > 1 with small filtered set
 - explicit assertions for `pageMetaDto`
 
-### 3) Observed a failing test and diagnosed it
-
-Failure encountered in scenario: partial match.
-
-- Expected by test: 2 results
-- Actual: 3 results
-
-Diagnosis:
-
-- The fixture used practitioner user with `firstName = "Partial"`.
-- Backend search correctly includes `user.firstName` and `user.lastName`.
-- Query `searchQuery = "PARTIAL"` therefore matched all kits for that user, including one kit whose `kitNumber/name` didn’t include `PARTIAL`.
-
-Conclusion:
-
-- The behavior was correct.
-- The test fixture setup was causing unintended matches.
-
-### 4) Fix I made for that test setup
-
-- I changed that test fixture `firstName` value from `Partial` to a non-matching value (`Alex`) so partial matching validates the intended target fields without accidental name-based matches.
-
-## Test run status during this work
-
-I attempted to run:
-
-- `yarn jest --config test/jest.integration.config.js test/integration/kit/services/get-practitioner-kits.service.int-spec.ts`
-
-Run was interrupted before completion, so I did not get a final full pass/fail completion signal in-session for the entire updated spec after the last interruption.
-
 ## Key clarification for frontend caveat
 
 When frontend does not reset page to 1 after query changes:
