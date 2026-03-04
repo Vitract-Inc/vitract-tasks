@@ -1,6 +1,6 @@
 # PRD: Duplicate Order Kits Audit System
 
-**Version:** 1.0  
+**Version:** 1.1  
 **Date:** 2026-03-04  
 **Status:** Draft  
 **Author:** System Architecture Team
@@ -9,25 +9,24 @@
 
 ## 1. Executive Summary
 
-This PRD outlines the design and implementation of a comprehensive audit system for tracking duplicate order kits from a backup database. The system will create two separate audit tables with their entities, establish a dedicated backup database connection, and provide both automated migration-based and standalone script-based cleanup mechanisms.
+This PRD outlines the design and implementation of a comprehensive audit system for tracking duplicate order kits sourced from a backup database. The system creates two separate audit tables in the main database, establishes a dedicated read-only backup database connection for reading backup `order-kits`, and provides CLI-based import and cleanup mechanisms.
 
 ### Goals
-- Create audit trail for all duplicate order kits from backup database
+- Create audit trail for all duplicate order kits sourced from backup data
 - Isolate special duplicate kits for specific order IDs
 - Enable safe, reversible cleanup operations
 - Maintain backward compatibility with existing systems
-- Support both migration-driven and standalone execution modes
+- Support migration-assisted setup with standalone CLI execution
 
 ### Quick Start Summary
 
 **What gets created:**
-1. Two new audit tables: `duplicate_order_kits` and `special_duplicate_order_kits`
-2. Two TypeORM entities with full audit trail support
-3. Separate backup database configuration (isolated from main DB)
+1. Two new audit tables in the main DB: `duplicate_order_kits` and `special_duplicate_order_kits`
+2. Two TypeORM entities with full audit-trail support
+3. Separate backup database configuration used only to read backup `order-kits`
 4. Six migration files (table creation + operation instructions)
 5. Import and cleanup services with dry-run support
 6. CLI commands for standalone execution
-7. Background job processors for async operations
 
 **How to use:**
 ```bash
@@ -40,6 +39,7 @@ yarn start:cli import:duplicate-order-kits --special
 
 # 3. Preview cleanup (dry-run)
 yarn start:cli cleanup:duplicate-order-kits --special --dry-run
+yarn start:cli cleanup:duplicate-order-kits --all --dry-run
 
 # 4. Execute cleanup
 yarn start:cli cleanup:duplicate-order-kits --special
@@ -48,11 +48,11 @@ yarn start:cli cleanup:duplicate-order-kits --all --confirm  # DESTRUCTIVE
 
 **Key Features:**
 - ✅ Backward compatible - no breaking changes
-- ✅ Standalone execution - works without migrations
+- ✅ Standalone execution - works without automatic orchestration
 - ✅ Dry-run mode - preview before cleanup
 - ✅ Audit trail - full history of all operations
 - ✅ Transaction safety - automatic rollback on errors
-- ✅ Background jobs - async processing for large datasets
+- ✅ Mirror-copy semantics - imported source fields preserve original values, including `id`
 
 ---
 
@@ -62,11 +62,11 @@ yarn start:cli cleanup:duplicate-order-kits --all --confirm  # DESTRUCTIVE
 - The system uses SQL Server (MSSQL) as the primary database
 - TypeORM manages entities and migrations
 - Migration files are located in `src/common/migrations/`
-- Background jobs use Bull queues with Redis
 - Database configuration is centralized in `src/config/db.ts`
+- CLI command patterns already exist in the codebase
 
 ### Problem Statement
-Duplicate order kits exist in a backup database that need to be:
+Duplicate order kits exist in a backup database and need to be:
 1. Audited and tracked in the main database
 2. Categorized (general duplicates vs. special order-specific duplicates)
 3. Cleaned up in a controlled, reversible manner
@@ -83,21 +83,21 @@ Duplicate order kits exist in a backup database that need to be:
 ### 3.1 Database Schema
 
 #### Table 1: `duplicate_order_kits`
-Stores all duplicate order kits from backup database.
+Stores main-database mirror copies of duplicate order-kit rows sourced from the backup `order-kits` table.
 
 ```sql
 CREATE TABLE duplicate_order_kits (
-  id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWSEQUENTIALID(),
-  createdAt DATETIME NOT NULL DEFAULT GETUTCDATE(),
-  updatedAt DATETIME NOT NULL DEFAULT GETUTCDATE(),
-  
+  id UNIQUEIDENTIFIER PRIMARY KEY, -- copied from backup row
+  createdAt DATETIME NOT NULL,     -- copied from backup row
+  updatedAt DATETIME NOT NULL,     -- copied from backup row
+
   -- Original data from backup
   orderId UNIQUEIDENTIFIER NOT NULL,
   kitId VARCHAR(255) NOT NULL,
   registrationStatus VARCHAR(50),
   registeredBy VARCHAR(50),
   registeredByUserId UNIQUEIDENTIFIER,
-  
+
   -- Audit metadata
   backupSourceTimestamp DATETIME,
   importedAt DATETIME NOT NULL DEFAULT GETUTCDATE(),
@@ -105,7 +105,7 @@ CREATE TABLE duplicate_order_kits (
   cleanedAt DATETIME,
   cleanupJobId VARCHAR(255),
   notes NVARCHAR(MAX),
-  
+
   INDEX idx_duplicate_order_kits_order_id (orderId),
   INDEX idx_duplicate_order_kits_kit_id (kitId),
   INDEX idx_duplicate_order_kits_cleanup_status (cleanupStatus)
@@ -113,34 +113,34 @@ CREATE TABLE duplicate_order_kits (
 ```
 
 #### Table 2: `special_duplicate_order_kits`
-Stores duplicate kits specific to the two special order IDs.
+Stores mirror copies of duplicate kits specific to the two special order IDs.
 
 ```sql
 CREATE TABLE special_duplicate_order_kits (
-  id UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWSEQUENTIALID(),
-  createdAt DATETIME NOT NULL DEFAULT GETUTCDATE(),
-  updatedAt DATETIME NOT NULL DEFAULT GETUTCDATE(),
-  
+  id UNIQUEIDENTIFIER PRIMARY KEY, -- copied from backup row
+  createdAt DATETIME NOT NULL,     -- copied from backup row
+  updatedAt DATETIME NOT NULL,     -- copied from backup row
+
   -- Original data from backup
   orderId UNIQUEIDENTIFIER NOT NULL,
   kitId VARCHAR(255) NOT NULL,
   registrationStatus VARCHAR(50),
   registeredBy VARCHAR(50),
   registeredByUserId UNIQUEIDENTIFIER,
-  
+
   -- Audit metadata
   backupSourceTimestamp DATETIME,
   importedAt DATETIME NOT NULL DEFAULT GETUTCDATE(),
   cleanupStatus VARCHAR(50) DEFAULT 'pending',
   cleanedAt DATETIME,
   cleanupJobId VARCHAR(255),
-  specialOrderReason NVARCHAR(500), -- Why this order is special
+  specialOrderReason NVARCHAR(500),
   notes NVARCHAR(MAX),
-  
+
   INDEX idx_special_duplicate_order_kits_order_id (orderId),
   INDEX idx_special_duplicate_order_kits_kit_id (kitId),
   INDEX idx_special_duplicate_order_kits_cleanup_status (cleanupStatus),
-  
+
   CONSTRAINT chk_special_order_ids CHECK (
     orderId IN (
       '7D01E25F-961C-F011-8B3D-6045BD8068CA',
@@ -156,14 +156,22 @@ CREATE TABLE special_duplicate_order_kits (
 Location: `src/audit/entity/duplicate-order-kit.entity.ts`
 
 ```typescript
-import { BaseEntity } from 'src/common';
-import { Entity, Column, Index } from 'typeorm';
+import { Entity, Column, Index, PrimaryColumn } from 'typeorm';
 
 @Entity('duplicate_order_kits')
 @Index('idx_duplicate_order_kits_order_id', ['orderId'])
 @Index('idx_duplicate_order_kits_kit_id', ['kitId'])
 @Index('idx_duplicate_order_kits_cleanup_status', ['cleanupStatus'])
-export class DuplicateOrderKit extends BaseEntity {
+export class DuplicateOrderKit {
+  @PrimaryColumn({ type: 'uuid' })
+  id: string; // mirror of backup row ID
+
+  @Column({ type: 'datetime' })
+  createdAt: Date; // mirror of backup row value
+
+  @Column({ type: 'datetime' })
+  updatedAt: Date; // mirror of backup row value
+
   @Column({ type: 'uuid' })
   orderId: string;
 
@@ -203,14 +211,22 @@ export class DuplicateOrderKit extends BaseEntity {
 Location: `src/audit/entity/special-duplicate-order-kit.entity.ts`
 
 ```typescript
-import { BaseEntity } from 'src/common';
-import { Entity, Column, Index } from 'typeorm';
+import { Entity, Column, Index, PrimaryColumn } from 'typeorm';
 
 @Entity('special_duplicate_order_kits')
 @Index('idx_special_duplicate_order_kits_order_id', ['orderId'])
 @Index('idx_special_duplicate_order_kits_kit_id', ['kitId'])
 @Index('idx_special_duplicate_order_kits_cleanup_status', ['cleanupStatus'])
-export class SpecialDuplicateOrderKit extends BaseEntity {
+export class SpecialDuplicateOrderKit {
+  @PrimaryColumn({ type: 'uuid' })
+  id: string; // mirror of backup row ID
+
+  @Column({ type: 'datetime' })
+  createdAt: Date; // mirror of backup row value
+
+  @Column({ type: 'datetime' })
+  updatedAt: Date; // mirror of backup row value
+
   @Column({ type: 'uuid' })
   orderId: string;
 
@@ -256,40 +272,32 @@ Location: `src/config/backup-db.ts`
 
 ```typescript
 import { TypeOrmModuleOptions } from '@nestjs/typeorm';
-import { NODE_ENV } from './keys';
-import * as dotenv from 'dotenv';
+import {
+  BACKUP_DATABASE_URL,
+  NODE_ENV,
+} from './keys';
+import splitPostgresConnectionString from 'src/common/utils/get-db-configs';
 
-dotenv.config();
-
-const {
-  BACKUP_DATABASE_HOST,
-  BACKUP_DATABASE_PORT,
-  BACKUP_DATABASE_USER,
-  BACKUP_DATABASE_PASSWORD,
-  BACKUP_DATABASE_NAME,
-} = process.env;
+const parsedBackupDatabase = BACKUP_DATABASE_URL
+  ? splitPostgresConnectionString(BACKUP_DATABASE_URL)
+  : null;
 
 class BackupDbConfig {
   public getTypeOrmConfig(): TypeOrmModuleOptions {
-    if (!BACKUP_DATABASE_HOST || !BACKUP_DATABASE_NAME) {
+    if (!BACKUP_DATABASE_URL || !parsedBackupDatabase) {
       throw new Error('Backup database configuration is incomplete');
     }
 
-    const port = Number(BACKUP_DATABASE_PORT) || 1433;
+    const port = Number(parsedBackupDatabase.port) || 1433;
 
     return {
       type: 'mssql',
-      host: BACKUP_DATABASE_HOST,
-      username: BACKUP_DATABASE_USER,
-      password: BACKUP_DATABASE_PASSWORD,
-      database: BACKUP_DATABASE_NAME,
+      host: parsedBackupDatabase.host,
+      username: parsedBackupDatabase.username,
+      password: parsedBackupDatabase.password,
+      database: parsedBackupDatabase.database,
       port,
       synchronize: false,
-      // Only include audit entities for backup DB
-      entities: [
-        'dist/audit/entity/duplicate-order-kit.entity.js',
-        'dist/audit/entity/special-duplicate-order-kit.entity.js',
-      ],
       options: {
         encrypt: true,
         trustServerCertificate: NODE_ENV !== 'production',
@@ -312,9 +320,6 @@ class BackupDbConfig {
     };
   }
 }
-
-const backupDbConfig = new BackupDbConfig();
-export { backupDbConfig };
 ```
 
 #### Environment Variables
@@ -322,12 +327,13 @@ Add to `.env`:
 
 ```bash
 # Backup Database Configuration
-BACKUP_DATABASE_HOST=backup-db-server.example.com
-BACKUP_DATABASE_PORT=1433
-BACKUP_DATABASE_USER=backup_user
-BACKUP_DATABASE_PASSWORD=secure_password
-BACKUP_DATABASE_NAME=vitract_backup
+BACKUP_DATABASE_URL=mssql://backup_user:secure_password@backup-db-server.example.com:1433/vitract_backup
 ```
+
+Important rules:
+- Backup DB credentials must be read-only
+- The backup DB connection exists only to read backup `order-kits`
+- Audit entities and audit tables exist only in the main database
 
 ---
 
@@ -339,10 +345,10 @@ All migrations will be created as separate files in `src/common/migrations/`:
 
 1. **Migration 1**: Create `duplicate_order_kits` table
 2. **Migration 2**: Create `special_duplicate_order_kits` table
-3. **Migration 3**: Import all duplicates from backup (runs background job)
-4. **Migration 4**: Import special duplicates from backup (runs background job)
-5. **Migration 5**: Cleanup special order duplicates (runs background job)
-6. **Migration 6**: Cleanup all duplicates (DESTRUCTIVE - runs background job)
+3. **Migration 3**: Import all duplicates from backup (prints CLI instructions)
+4. **Migration 4**: Import special duplicates from backup (prints CLI instructions)
+5. **Migration 5**: Cleanup special order duplicates (prints CLI instructions)
+6. **Migration 6**: Cleanup all duplicates (DESTRUCTIVE - prints CLI instructions)
 
 ### 4.2 Migration 1: Create `duplicate_order_kits` Table
 
@@ -359,12 +365,9 @@ export class CreateDuplicateOrderKitsTable1772000000001
   public async up(queryRunner: QueryRunner): Promise<void> {
     await queryRunner.query(`
       CREATE TABLE "duplicate_order_kits" (
-        "id" uniqueidentifier NOT NULL
-          CONSTRAINT "DF_duplicate_order_kits_id" DEFAULT NEWSEQUENTIALID(),
-        "createdAt" datetime NOT NULL
-          CONSTRAINT "DF_duplicate_order_kits_createdAt" DEFAULT GETUTCDATE(),
-        "updatedAt" datetime NOT NULL
-          CONSTRAINT "DF_duplicate_order_kits_updatedAt" DEFAULT GETUTCDATE(),
+        "id" uniqueidentifier NOT NULL,
+        "createdAt" datetime NOT NULL,
+        "updatedAt" datetime NOT NULL,
         "orderId" uniqueidentifier NOT NULL,
         "kitId" varchar(255) NOT NULL,
         "registrationStatus" varchar(50),
@@ -397,16 +400,6 @@ export class CreateDuplicateOrderKitsTable1772000000001
       ON "duplicate_order_kits" ("cleanupStatus")
     `);
   }
-
-  public async down(queryRunner: QueryRunner): Promise<void> {
-    await queryRunner.query(`DROP INDEX "idx_duplicate_order_kits_cleanup_status"
-      ON "duplicate_order_kits"`);
-    await queryRunner.query(`DROP INDEX "idx_duplicate_order_kits_kit_id"
-      ON "duplicate_order_kits"`);
-    await queryRunner.query(`DROP INDEX "idx_duplicate_order_kits_order_id"
-      ON "duplicate_order_kits"`);
-    await queryRunner.query(`DROP TABLE "duplicate_order_kits"`);
-  }
 }
 ```
 
@@ -425,12 +418,9 @@ export class CreateSpecialDuplicateOrderKitsTable1772000000002
   public async up(queryRunner: QueryRunner): Promise<void> {
     await queryRunner.query(`
       CREATE TABLE "special_duplicate_order_kits" (
-        "id" uniqueidentifier NOT NULL
-          CONSTRAINT "DF_special_duplicate_order_kits_id" DEFAULT NEWSEQUENTIALID(),
-        "createdAt" datetime NOT NULL
-          CONSTRAINT "DF_special_duplicate_order_kits_createdAt" DEFAULT GETUTCDATE(),
-        "updatedAt" datetime NOT NULL
-          CONSTRAINT "DF_special_duplicate_order_kits_updatedAt" DEFAULT GETUTCDATE(),
+        "id" uniqueidentifier NOT NULL,
+        "createdAt" datetime NOT NULL,
+        "updatedAt" datetime NOT NULL,
         "orderId" uniqueidentifier NOT NULL,
         "kitId" varchar(255) NOT NULL,
         "registrationStatus" varchar(50),
@@ -454,201 +444,50 @@ export class CreateSpecialDuplicateOrderKitsTable1772000000002
         )
       )
     `);
-
-    await queryRunner.query(`
-      CREATE INDEX "idx_special_duplicate_order_kits_order_id"
-      ON "special_duplicate_order_kits" ("orderId")
-    `);
-
-    await queryRunner.query(`
-      CREATE INDEX "idx_special_duplicate_order_kits_kit_id"
-      ON "special_duplicate_order_kits" ("kitId")
-    `);
-
-    await queryRunner.query(`
-      CREATE INDEX "idx_special_duplicate_order_kits_cleanup_status"
-      ON "special_duplicate_order_kits" ("cleanupStatus")
-    `);
-  }
-
-  public async down(queryRunner: QueryRunner): Promise<void> {
-    await queryRunner.query(`DROP INDEX "idx_special_duplicate_order_kits_cleanup_status"
-      ON "special_duplicate_order_kits"`);
-    await queryRunner.query(`DROP INDEX "idx_special_duplicate_order_kits_kit_id"
-      ON "special_duplicate_order_kits"`);
-    await queryRunner.query(`DROP INDEX "idx_special_duplicate_order_kits_order_id"
-      ON "special_duplicate_order_kits"`);
-    await queryRunner.query(`DROP TABLE "special_duplicate_order_kits"`);
   }
 }
 ```
 
-### 4.4 Migration 3: Import All Duplicates (Background Job)
+### 4.4 Migration 3: Import All Duplicates
 
 Location: `src/common/migrations/1772000000003-import-all-duplicate-order-kits.ts`
 
-```typescript
-import { MigrationInterface, QueryRunner } from 'typeorm';
+This migration does not import data automatically. It prints the correct operator command:
 
-export class ImportAllDuplicateOrderKits1772000000003
-  implements MigrationInterface
-{
-  name = 'ImportAllDuplicateOrderKits1772000000003';
-
-  public async up(queryRunner: QueryRunner): Promise<void> {
-    // This migration triggers a background job to import duplicates
-    // The actual import logic is in a service that can be run independently
-
-    console.log('');
-    console.log('='.repeat(80));
-    console.log('MIGRATION: Import All Duplicate Order Kits');
-    console.log('='.repeat(80));
-    console.log('');
-    console.log('This migration has created the necessary tables.');
-    console.log('');
-    console.log('To import duplicate order kits from the backup database, run:');
-    console.log('');
-    console.log('  yarn start:cli import:duplicate-order-kits --all');
-    console.log('');
-    console.log('Or to run as a background job:');
-    console.log('');
-    console.log('  yarn start:cli import:duplicate-order-kits --all --background');
-    console.log('');
-    console.log('='.repeat(80));
-    console.log('');
-  }
-
-  public async down(queryRunner: QueryRunner): Promise<void> {
-    // Rollback: Delete all imported records
-    await queryRunner.query(`DELETE FROM "duplicate_order_kits"`);
-  }
-}
+```bash
+yarn start:cli import:duplicate-order-kits --all
 ```
 
-### 4.5 Migration 4: Import Special Duplicates (Background Job)
+### 4.5 Migration 4: Import Special Duplicates
 
 Location: `src/common/migrations/1772000000004-import-special-duplicate-order-kits.ts`
 
-```typescript
-import { MigrationInterface, QueryRunner } from 'typeorm';
+This migration prints:
 
-export class ImportSpecialDuplicateOrderKits1772000000004
-  implements MigrationInterface
-{
-  name = 'ImportSpecialDuplicateOrderKits1772000000004';
-
-  public async up(queryRunner: QueryRunner): Promise<void> {
-    console.log('');
-    console.log('='.repeat(80));
-    console.log('MIGRATION: Import Special Duplicate Order Kits');
-    console.log('='.repeat(80));
-    console.log('');
-    console.log('To import special duplicate order kits for specific orders, run:');
-    console.log('');
-    console.log('  yarn start:cli import:duplicate-order-kits --special');
-    console.log('');
-    console.log('This will import duplicates for orders:');
-    console.log('  - 7D01E25F-961C-F011-8B3D-6045BD8068CA');
-    console.log('  - 750A2CC5-0A22-F011-8B3D-6045BD8068CA');
-    console.log('');
-    console.log('='.repeat(80));
-    console.log('');
-  }
-
-  public async down(queryRunner: QueryRunner): Promise<void> {
-    await queryRunner.query(`DELETE FROM "special_duplicate_order_kits"`);
-  }
-}
+```bash
+yarn start:cli import:duplicate-order-kits --special
 ```
 
 ### 4.6 Migration 5: Cleanup Special Order Duplicates
 
 Location: `src/common/migrations/1772000000005-cleanup-special-order-duplicates.ts`
 
-```typescript
-import { MigrationInterface, QueryRunner } from 'typeorm';
+This migration prints:
 
-export class CleanupSpecialOrderDuplicates1772000000005
-  implements MigrationInterface
-{
-  name = 'CleanupSpecialOrderDuplicates1772000000005';
-
-  public async up(queryRunner: QueryRunner): Promise<void> {
-    console.log('');
-    console.log('='.repeat(80));
-    console.log('MIGRATION: Cleanup Special Order Duplicates');
-    console.log('='.repeat(80));
-    console.log('');
-    console.log('⚠️  WARNING: This operation will clean up duplicate order kits');
-    console.log('for special orders. This is a DESTRUCTIVE operation.');
-    console.log('');
-    console.log('To proceed with cleanup, run:');
-    console.log('');
-    console.log('  yarn start:cli cleanup:duplicate-order-kits --special --dry-run');
-    console.log('');
-    console.log('Review the dry-run results, then execute:');
-    console.log('');
-    console.log('  yarn start:cli cleanup:duplicate-order-kits --special');
-    console.log('');
-    console.log('='.repeat(80));
-    console.log('');
-  }
-
-  public async down(queryRunner: QueryRunner): Promise<void> {
-    // Rollback: Reset cleanup status
-    await queryRunner.query(`
-      UPDATE "special_duplicate_order_kits"
-      SET "cleanupStatus" = 'pending',
-          "cleanedAt" = NULL,
-          "cleanupJobId" = NULL
-      WHERE "cleanupStatus" = 'cleaned'
-    `);
-  }
-}
+```bash
+yarn start:cli cleanup:duplicate-order-kits --special --dry-run
+yarn start:cli cleanup:duplicate-order-kits --special
 ```
 
 ### 4.7 Migration 6: Cleanup All Duplicates (DESTRUCTIVE)
 
 Location: `src/common/migrations/1772000000006-cleanup-all-duplicates.ts`
 
-```typescript
-import { MigrationInterface, QueryRunner } from 'typeorm';
+This migration prints:
 
-export class CleanupAllDuplicates1772000000006 implements MigrationInterface {
-  name = 'CleanupAllDuplicates1772000000006';
-
-  public async up(queryRunner: QueryRunner): Promise<void> {
-    console.log('');
-    console.log('='.repeat(80));
-    console.log('MIGRATION: Cleanup All Duplicate Order Kits');
-    console.log('='.repeat(80));
-    console.log('');
-    console.log('⚠️  CRITICAL WARNING: This is a DESTRUCTIVE operation!');
-    console.log('This will clean up ALL duplicate order kits from the system.');
-    console.log('');
-    console.log('ALWAYS run a dry-run first:');
-    console.log('');
-    console.log('  yarn start:cli cleanup:duplicate-order-kits --all --dry-run');
-    console.log('');
-    console.log('After reviewing the dry-run results and backing up data:');
-    console.log('');
-    console.log('  yarn start:cli cleanup:duplicate-order-kits --all --confirm');
-    console.log('');
-    console.log('='.repeat(80));
-    console.log('');
-  }
-
-  public async down(queryRunner: QueryRunner): Promise<void> {
-    // Rollback: Reset cleanup status for all records
-    await queryRunner.query(`
-      UPDATE "duplicate_order_kits"
-      SET "cleanupStatus" = 'pending',
-          "cleanedAt" = NULL,
-          "cleanupJobId" = NULL
-      WHERE "cleanupStatus" = 'cleaned'
-    `);
-  }
-}
+```bash
+yarn start:cli cleanup:duplicate-order-kits --all --dry-run
+yarn start:cli cleanup:duplicate-order-kits --all --confirm
 ```
 
 ---
@@ -661,8 +500,8 @@ Location: `src/audit/services/import-duplicate-order-kits.service.ts`
 
 **Responsibilities:**
 - Connect to backup database
-- Query duplicate order kits
-- Import into appropriate audit tables
+- Read duplicate source rows from backup `order-kits`
+- Import mirror copies into the main database audit tables
 - Handle batch processing for large datasets
 - Provide progress reporting
 
@@ -697,92 +536,12 @@ class CleanupDuplicateOrderKitsService {
 }
 ```
 
-### 5.3 Queue Job Types
+### 5.3 Execution Rules
 
-Location: `src/queues/types/queue.types.ts`
-
-Add new job types:
-
-```typescript
-export enum JobTypes {
-  // ... existing types
-  IMPORT_DUPLICATE_ORDER_KITS = 'import-duplicate-order-kits',
-  CLEANUP_DUPLICATE_ORDER_KITS = 'cleanup-duplicate-order-kits',
-}
-
-export interface ImportDuplicateOrderKitsJobData {
-  scope: 'all' | 'special';
-  batchSize?: number;
-  startFrom?: number;
-}
-
-export interface CleanupDuplicateOrderKitsJobData {
-  scope: 'all' | 'special';
-  dryRun: boolean;
-  confirmationToken?: string;
-}
-```
-
-### 5.4 Queue Processor
-
-Location: `src/queues/processors/duplicate-order-kits.processor.ts`
-
-```typescript
-import { Processor, Process } from '@nestjs/bull';
-import { Job } from 'bull';
-import { Injectable, Logger } from '@nestjs/common';
-import { QueueNames, JobTypes } from '../types/queue.types';
-import { ImportDuplicateOrderKitsService } from 'src/audit/services/import-duplicate-order-kits.service';
-import { CleanupDuplicateOrderKitsService } from 'src/audit/services/cleanup-duplicate-order-kits.service';
-
-@Injectable()
-@Processor(QueueNames.AUDIT)
-export class DuplicateOrderKitsProcessor {
-  private readonly logger = new Logger(DuplicateOrderKitsProcessor.name);
-
-  constructor(
-    private readonly importService: ImportDuplicateOrderKitsService,
-    private readonly cleanupService: CleanupDuplicateOrderKitsService,
-  ) {}
-
-  @Process({ name: JobTypes.IMPORT_DUPLICATE_ORDER_KITS, concurrency: 1 })
-  async handleImport(job: Job<ImportDuplicateOrderKitsJobData>): Promise<any> {
-    const { scope, batchSize } = job.data;
-
-    this.logger.log(`Starting import of ${scope} duplicate order kits`);
-
-    if (scope === 'all') {
-      return await this.importService.importAll({ batchSize });
-    } else {
-      return await this.importService.importSpecial({ batchSize });
-    }
-  }
-
-  @Process({ name: JobTypes.CLEANUP_DUPLICATE_ORDER_KITS, concurrency: 1 })
-  async handleCleanup(job: Job<CleanupDuplicateOrderKitsJobData>): Promise<any> {
-    const { scope, dryRun, confirmationToken } = job.data;
-
-    this.logger.log(`Starting cleanup of ${scope} duplicates (dryRun: ${dryRun})`);
-
-    if (dryRun) {
-      return await this.cleanupService.dryRun(scope);
-    }
-
-    if (scope === 'all' && !confirmationToken) {
-      throw new Error('Confirmation token required for cleanup all operation');
-    }
-
-    if (scope === 'special') {
-      return await this.cleanupService.cleanupSpecial({ dryRun: false });
-    } else {
-      return await this.cleanupService.cleanupAll({
-        dryRun: false,
-        confirmationToken
-      });
-    }
-  }
-}
-```
+- Import and cleanup operations are CLI-only
+- No queue job types are required for this feature
+- No queue processor is required for this feature
+- Long-running operations rely on batch size, transaction control, and structured CLI output
 
 ---
 
@@ -793,190 +552,35 @@ export class DuplicateOrderKitsProcessor {
 Location: `src/cli/commands/import-duplicate-order-kits.command.ts`
 
 ```typescript
-import { Injectable } from '@nestjs/common';
-import { Command, CommandRunner, Option } from 'nest-commander';
-import { ImportDuplicateOrderKitsService } from 'src/audit/services/import-duplicate-order-kits.service';
-
 interface ImportCommandOptions {
   all?: boolean;
   special?: boolean;
-  background?: boolean;
   batchSize?: number;
 }
-
-@Injectable()
-@Command({
-  name: 'import:duplicate-order-kits',
-  description: 'Import duplicate order kits from backup database',
-})
-export class ImportDuplicateOrderKitsCommand extends CommandRunner {
-  constructor(
-    private readonly importService: ImportDuplicateOrderKitsService,
-  ) {
-    super();
-  }
-
-  async run(
-    passedParams: string[],
-    options: ImportCommandOptions,
-  ): Promise<void> {
-    const scope = options.all ? 'all' : options.special ? 'special' : null;
-
-    if (!scope) {
-      console.error('Error: Must specify --all or --special');
-      process.exit(1);
-    }
-
-    console.log(`Importing ${scope} duplicate order kits...`);
-
-    if (options.background) {
-      // Queue the job
-      console.log('Job queued for background processing');
-    } else {
-      // Run synchronously
-      const result = scope === 'all'
-        ? await this.importService.importAll({ batchSize: options.batchSize })
-        : await this.importService.importSpecial({ batchSize: options.batchSize });
-
-      console.log('Import completed:', result);
-    }
-  }
-
-  @Option({
-    flags: '--all',
-    description: 'Import all duplicate order kits',
-  })
-  parseAll(): boolean {
-    return true;
-  }
-
-  @Option({
-    flags: '--special',
-    description: 'Import only special order duplicates',
-  })
-  parseSpecial(): boolean {
-    return true;
-  }
-
-  @Option({
-    flags: '--background',
-    description: 'Run as background job',
-  })
-  parseBackground(): boolean {
-    return true;
-  }
-
-  @Option({
-    flags: '--batch-size <size>',
-    description: 'Batch size for import (default: 1000)',
-  })
-  parseBatchSize(val: string): number {
-    return parseInt(val, 10);
-  }
-}
 ```
+
+Rules:
+- Must specify exactly one of `--all` or `--special`
+- Supports `--batch-size <size>`
+- Does not support `--background`
 
 ### 6.2 Cleanup Command
 
 Location: `src/cli/commands/cleanup-duplicate-order-kits.command.ts`
 
 ```typescript
-import { Injectable } from '@nestjs/common';
-import { Command, CommandRunner, Option } from 'nest-commander';
-import { CleanupDuplicateOrderKitsService } from 'src/audit/services/cleanup-duplicate-order-kits.service';
-
 interface CleanupCommandOptions {
   all?: boolean;
   special?: boolean;
   dryRun?: boolean;
   confirm?: boolean;
 }
-
-@Injectable()
-@Command({
-  name: 'cleanup:duplicate-order-kits',
-  description: 'Cleanup duplicate order kits (DESTRUCTIVE)',
-})
-export class CleanupDuplicateOrderKitsCommand extends CommandRunner {
-  constructor(
-    private readonly cleanupService: CleanupDuplicateOrderKitsService,
-  ) {
-    super();
-  }
-
-  async run(
-    passedParams: string[],
-    options: CleanupCommandOptions,
-  ): Promise<void> {
-    const scope = options.all ? 'all' : options.special ? 'special' : null;
-
-    if (!scope) {
-      console.error('Error: Must specify --all or --special');
-      process.exit(1);
-    }
-
-    if (options.dryRun) {
-      console.log(`Running dry-run for ${scope} cleanup...`);
-      const result = await this.cleanupService.dryRun(scope);
-      console.log('Dry-run results:', result);
-      return;
-    }
-
-    if (scope === 'all' && !options.confirm) {
-      console.error('');
-      console.error('⚠️  ERROR: --confirm flag required for --all cleanup');
-      console.error('This is a DESTRUCTIVE operation that will delete data.');
-      console.error('');
-      console.error('Run with --dry-run first to preview changes.');
-      console.error('');
-      process.exit(1);
-    }
-
-    console.log(`⚠️  Starting ${scope} cleanup (DESTRUCTIVE)...`);
-
-    const result = scope === 'special'
-      ? await this.cleanupService.cleanupSpecial({ dryRun: false })
-      : await this.cleanupService.cleanupAll({
-          dryRun: false,
-          confirmationToken: 'CONFIRMED'
-        });
-
-    console.log('Cleanup completed:', result);
-  }
-
-  @Option({
-    flags: '--all',
-    description: 'Cleanup all duplicate order kits',
-  })
-  parseAll(): boolean {
-    return true;
-  }
-
-  @Option({
-    flags: '--special',
-    description: 'Cleanup only special order duplicates',
-  })
-  parseSpecial(): boolean {
-    return true;
-  }
-
-  @Option({
-    flags: '--dry-run',
-    description: 'Preview cleanup without making changes',
-  })
-  parseDryRun(): boolean {
-    return true;
-  }
-
-  @Option({
-    flags: '--confirm',
-    description: 'Confirm destructive cleanup operation',
-  })
-  parseConfirm(): boolean {
-    return true;
-  }
-}
 ```
+
+Rules:
+- Must specify exactly one of `--all` or `--special`
+- `--dry-run` previews mutation
+- `--confirm` is required for `--all`
 
 ---
 
@@ -986,76 +590,21 @@ export class CleanupDuplicateOrderKitsCommand extends CommandRunner {
 
 Location: `src/audit/audit.module.ts`
 
-```typescript
-import { Module } from '@nestjs/common';
-import { TypeOrmModule } from '@nestjs/typeorm';
-import { DuplicateOrderKit } from './entity/duplicate-order-kit.entity';
-import { SpecialDuplicateOrderKit } from './entity/special-duplicate-order-kit.entity';
-import { ImportDuplicateOrderKitsService } from './services/import-duplicate-order-kits.service';
-import { CleanupDuplicateOrderKitsService } from './services/cleanup-duplicate-order-kits.service';
-import { AuditController } from './audit.controller';
-
-@Module({
-  imports: [
-    TypeOrmModule.forFeature([
-      DuplicateOrderKit,
-      SpecialDuplicateOrderKit,
-    ]),
-  ],
-  controllers: [AuditController],
-  providers: [
-    ImportDuplicateOrderKitsService,
-    CleanupDuplicateOrderKitsService,
-  ],
-  exports: [
-    ImportDuplicateOrderKitsService,
-    CleanupDuplicateOrderKitsService,
-  ],
-})
-export class AuditModule {}
-```
+Responsibilities:
+- Register audit entities against the main DB
+- Export services for CLI execution
 
 ### 7.2 Update App Module
 
-Location: `src/app.module.ts`
-
-Add the AuditModule to imports:
-
-```typescript
-import { AuditModule } from './audit/audit.module';
-
-@Module({
-  imports: [
-    // ... existing imports
-    AuditModule,
-  ],
-  // ...
-})
-export class AppModule {}
-```
+The application should register the audit module without changing existing business flows.
 
 ### 7.3 Update CLI Command Module
 
-Location: `src/cli/command.module.ts`
+CLI command registration is required for:
+- `import:duplicate-order-kits`
+- `cleanup:duplicate-order-kits`
 
-```typescript
-import { ImportDuplicateOrderKitsCommand } from './commands/import-duplicate-order-kits.command';
-import { CleanupDuplicateOrderKitsCommand } from './commands/cleanup-duplicate-order-kits.command';
-import { AuditModule } from 'src/audit/audit.module';
-
-@Module({
-  imports: [
-    // ... existing imports
-    AuditModule,
-  ],
-  providers: [
-    // ... existing providers
-    ImportDuplicateOrderKitsCommand,
-    CleanupDuplicateOrderKitsCommand,
-  ],
-})
-export class CommandModule {}
-```
+No queue processor module changes are required for this feature.
 
 ---
 
@@ -1063,29 +612,23 @@ export class CommandModule {}
 
 ### 8.1 Design Principles
 
-1. **Non-Breaking Changes**: All new tables and entities are additive
-2. **Isolated Database Connection**: Backup DB config is separate and optional
-3. **Graceful Degradation**: System continues to work if backup DB is unavailable
-4. **Migration Safety**: All migrations are reversible with `down()` methods
-5. **Feature Flags**: Can be controlled via environment variables
+1. **Non-Breaking Additions Only**: New tables, entities, and commands are additive
+2. **No Existing Code Changes**: Current API and business logic remain untouched
+3. **Graceful Degradation**: The application continues to work when backup DB is not configured, unless backup-specific CLI commands are invoked
 
 ### 8.2 Environment Variable Guards
 
 ```typescript
-// In services that use backup DB
-if (!process.env.BACKUP_DATABASE_HOST) {
-  this.logger.warn('Backup database not configured, skipping import');
+if (!BACKUP_DATABASE_URL) {
   return { skipped: true, reason: 'No backup database configured' };
 }
 ```
 
 ### 8.3 Rollback Strategy
 
-Each migration includes a `down()` method that:
-- Drops created tables
-- Deletes imported data
-- Resets cleanup status
-- Preserves data integrity
+- Table creation migrations can be reverted
+- Cleanup metadata can be reset where safe
+- Operators must review dry-run output before destructive runs
 
 ---
 
@@ -1093,60 +636,22 @@ Each migration includes a `down()` method that:
 
 ### 9.1 Migration-Driven Execution
 
-**Use Case**: Automated deployment pipelines
-
 ```bash
-# Run all migrations including audit setup
 yarn migration:run
 ```
 
-**Behavior**:
-- Creates tables automatically
-- Prints instructions for manual data import
-- Does NOT automatically import or cleanup data
-- Safe for production deployments
+This creates schema and prints operator instructions.
 
 ### 9.2 Standalone CLI Execution
 
-**Use Case**: Manual operations, testing, one-off tasks
-
 ```bash
-# Import all duplicates
 yarn start:cli import:duplicate-order-kits --all
-
-# Import special duplicates only
 yarn start:cli import:duplicate-order-kits --special
-
-# Dry-run cleanup
 yarn start:cli cleanup:duplicate-order-kits --special --dry-run
-
-# Execute cleanup
 yarn start:cli cleanup:duplicate-order-kits --special
 ```
 
-**Behavior**:
-- Can run independently of migrations
-- Provides immediate feedback
-- Supports dry-run mode
-- Requires explicit confirmation for destructive operations
-
-### 9.3 Background Job Execution
-
-**Use Case**: Large datasets, long-running operations
-
-```bash
-# Queue import job
-yarn start:cli import:duplicate-order-kits --all --background
-
-# Monitor via Bull Board
-# Visit: http://localhost:3000/v1/admin/queues
-```
-
-**Behavior**:
-- Runs asynchronously
-- Provides progress tracking
-- Handles failures with retries
-- Logs detailed execution history
+There is no background-job execution mode for this feature.
 
 ---
 
@@ -1154,53 +659,21 @@ yarn start:cli import:duplicate-order-kits --all --background
 
 ### 10.1 Dry-Run Mode
 
-All cleanup operations support dry-run:
-
-```typescript
-interface DryRunResult {
-  scope: 'all' | 'special';
-  totalRecords: number;
-  recordsToClean: number;
-  estimatedDuration: string;
-  affectedOrders: string[];
-  warnings: string[];
-}
-```
+- All cleanup paths must support dry-run preview
 
 ### 10.2 Confirmation Requirements
 
-Destructive operations require explicit confirmation:
-
-```typescript
-// For cleanup all
-if (scope === 'all' && !confirmationToken) {
-  throw new Error('Confirmation required for cleanup all');
-}
-```
+- `cleanup --all` requires `--confirm`
 
 ### 10.3 Audit Trail
 
-Every operation is logged:
-
-```typescript
-{
-  cleanupStatus: 'cleaned',
-  cleanedAt: new Date(),
-  cleanupJobId: 'job-12345',
-  notes: 'Cleaned via CLI command on 2026-03-04'
-}
-```
+- Imported audit rows persist in main DB
+- Cleanup actions update audit metadata
 
 ### 10.4 Transaction Safety
 
-All database operations use transactions:
-
-```typescript
-await this.dataSource.transaction(async (manager) => {
-  // Import or cleanup operations
-  // Automatically rolled back on error
-});
-```
+- Batch imports should be transactional where practical
+- Partial failures must be explicit and observable
 
 ---
 
@@ -1208,29 +681,26 @@ await this.dataSource.transaction(async (manager) => {
 
 ### 11.1 Logging
 
-All services use NestJS Logger:
-
-```typescript
-this.logger.log('Starting import of duplicate order kits');
-this.logger.warn('Backup database connection slow');
-this.logger.error('Failed to import batch', error);
-```
+Structured logs should include:
+- Command name
+- Scope
+- Batch size
+- Duration
+- Processed/imported/cleaned/skipped counts
 
 ### 11.2 Metrics
 
-Track key metrics:
-- Import duration
-- Records processed
-- Cleanup count
-- Error rate
-- Job queue depth
+Useful operator signals:
+- CLI run duration
+- Batch throughput
+- Import counts
+- Cleanup candidate counts
+- Cleanup final counts
 
-### 11.3 Bull Board Integration
+### 11.3 Operational Visibility
 
-Monitor background jobs at:
-```
-http://localhost:3000/v1/admin/queues
-```
+This feature does not depend on Bull Board or queue monitoring.
+Operational visibility comes from CLI output, application logs, and direct database queries.
 
 ---
 
@@ -1238,44 +708,22 @@ http://localhost:3000/v1/admin/queues
 
 ### 12.1 Unit Tests
 
-**Entity Tests**:
-- Validate entity structure
-- Test constraints (e.g., special order ID check)
-- Verify default values
-
-**Service Tests**:
-- Mock backup database connection
-- Test batch processing logic
-- Verify error handling
-- Test dry-run mode
+- Backup database configuration parsing
+- Import service mapping logic
+- Cleanup confirmation behavior
+- CLI parsing and validation
 
 ### 12.2 Integration Tests
 
-**Migration Tests**:
-- Test up/down migrations
-- Verify table creation
-- Test rollback scenarios
-
-**Import Tests**:
-- Test with sample backup data
-- Verify data transformation
-- Test batch processing
-- Verify transaction rollback on error
-
-**Cleanup Tests**:
-- Test dry-run accuracy
-- Verify cleanup logic
-- Test audit trail updates
-- Verify data integrity after cleanup
+- Import into `duplicate_order_kits`
+- Import into `special_duplicate_order_kits`
+- Mirror-copy preservation for source fields, including `id`
+- Dry-run and destructive cleanup flows
+- Migration registration and execution
 
 ### 12.3 E2E Tests
 
-**Full Workflow**:
-1. Run migrations
-2. Import duplicates
-3. Run dry-run cleanup
-4. Execute cleanup
-5. Verify results
+- Production-like CLI execution against MSSQL
 
 ---
 
@@ -1291,14 +739,12 @@ http://localhost:3000/v1/admin/queues
 ### Phase 2: Import System (Week 2)
 - [ ] Implement import service
 - [ ] Create import CLI command
-- [ ] Create import queue processor
 - [ ] Create migration files (3-4)
 - [ ] Write integration tests for import
 
 ### Phase 3: Cleanup System (Week 3)
 - [ ] Implement cleanup service
 - [ ] Create cleanup CLI command
-- [ ] Create cleanup queue processor
 - [ ] Create migration files (5-6)
 - [ ] Write integration tests for cleanup
 
@@ -1323,65 +769,35 @@ http://localhost:3000/v1/admin/queues
 ### 14.1 Initial Setup
 
 ```bash
-# 1. Set environment variables
-export BACKUP_DATABASE_HOST=backup-server.example.com
-export BACKUP_DATABASE_PORT=1433
-export BACKUP_DATABASE_USER=backup_user
-export BACKUP_DATABASE_PASSWORD=secure_password
-export BACKUP_DATABASE_NAME=vitract_backup
-
-# 2. Run migrations
+export BACKUP_DATABASE_URL=mssql://backup-user:secure-password@backup-server.example.com:1433/vitract_backup
 yarn migration:run
-
-# 3. Verify tables created
-# Check database for duplicate_order_kits and special_duplicate_order_kits tables
 ```
 
 ### 14.2 Import Duplicates
 
 ```bash
-# Import all duplicates (recommended first)
 yarn start:cli import:duplicate-order-kits --all
-
-# Or import as background job for large datasets
-yarn start:cli import:duplicate-order-kits --all --background
-
-# Import special duplicates
 yarn start:cli import:duplicate-order-kits --special
 ```
 
 ### 14.3 Cleanup Operations
 
 ```bash
-# ALWAYS run dry-run first
 yarn start:cli cleanup:duplicate-order-kits --special --dry-run
-
-# Review dry-run results, then execute
 yarn start:cli cleanup:duplicate-order-kits --special
-
-# For cleanup all (DESTRUCTIVE)
 yarn start:cli cleanup:duplicate-order-kits --all --dry-run
-# Review carefully, then:
 yarn start:cli cleanup:duplicate-order-kits --all --confirm
 ```
 
 ### 14.4 Monitoring
 
-```bash
-# Check import status
-SELECT
-  COUNT(*) as total,
-  cleanupStatus,
-  COUNT(*) * 100.0 / SUM(COUNT(*)) OVER() as percentage
+```sql
+SELECT cleanupStatus, COUNT(*)
 FROM duplicate_order_kits
 GROUP BY cleanupStatus;
 
-# Check special duplicates
 SELECT * FROM special_duplicate_order_kits
 WHERE cleanupStatus = 'pending';
-
-# Monitor background jobs
-# Visit: http://localhost:3000/v1/admin/queues
 ```
 
 ### 14.5 Troubleshooting
@@ -1389,30 +805,21 @@ WHERE cleanupStatus = 'pending';
 **Issue**: Import fails with connection timeout
 
 ```bash
-# Solution: Increase connection timeout in backup-db.ts
-# Or run with smaller batch size
 yarn start:cli import:duplicate-order-kits --all --batch-size 500
 ```
 
 **Issue**: Cleanup dry-run shows unexpected results
 
-```bash
-# Solution: Review the records manually
-SELECT * FROM duplicate_order_kits
-WHERE cleanupStatus = 'pending'
-LIMIT 100;
-
-# Verify against source data in backup DB
+```sql
+SELECT TOP 100 *
+FROM duplicate_order_kits
+WHERE cleanupStatus = 'pending';
 ```
 
 **Issue**: Migration rollback needed
 
 ```bash
-# Rollback last migration
 yarn migration:revert
-
-# Rollback specific migration
-# Edit migration file and run down() method manually
 ```
 
 ---
@@ -1428,17 +835,15 @@ yarn migration:revert
 
 ### 15.2 Data Privacy
 
-- Audit tables contain PII (user IDs, kit IDs)
+- Audit tables contain PII-sensitive operational identifiers
 - Apply same access controls as main database
 - Consider data retention policies
-- Implement audit log for who accessed cleanup commands
 
 ### 15.3 Operation Authorization
 
-- Cleanup operations require admin privileges
-- Log all cleanup operations with user context
-- Implement approval workflow for production cleanup
-- Require confirmation tokens for destructive operations
+- Cleanup operations require admin/operator privileges
+- Log all cleanup operations with user context where available
+- Require confirmation for destructive operations
 
 ---
 
@@ -1449,14 +854,14 @@ yarn migration:revert
 - Default batch size: 1000 records
 - Configurable via CLI: `--batch-size <n>`
 - Process in transactions to prevent partial imports
-- Use bulk insert operations
+- Use bulk insert operations where safe
 
 ### 16.2 Indexing Strategy
 
 Indexes created for optimal query performance:
-- `orderId` - For filtering by order
-- `kitId` - For kit lookups
-- `cleanupStatus` - For cleanup queries
+- `orderId` - for filtering by order
+- `kitId` - for kit lookups
+- `cleanupStatus` - for cleanup queries
 
 ### 16.3 Connection Pooling
 
@@ -1469,7 +874,7 @@ Backup database connection pool:
 ### 16.4 Large Dataset Handling
 
 For datasets > 100K records:
-- Use background job execution
+- Use CLI batching with explicit operator control
 - Implement progress tracking
 - Consider chunking by date ranges
 - Monitor memory usage
@@ -1480,13 +885,13 @@ For datasets > 100K records:
 
 ### 17.1 Functional Requirements
 
-- ✅ Two audit tables created successfully
+- ✅ Two audit tables created successfully in the main DB
 - ✅ Backup database connection isolated and working
-- ✅ Import all duplicates from backup
+- ✅ Import all duplicates from backup `order-kits`
 - ✅ Import special duplicates for specific orders
 - ✅ Cleanup special order duplicates
 - ✅ Cleanup all duplicates (destructive)
-- ✅ All operations reversible via migrations
+- ✅ All operations reversible via migrations where applicable
 
 ### 17.2 Non-Functional Requirements
 
@@ -1496,11 +901,10 @@ For datasets > 100K records:
 - ✅ Comprehensive audit trail
 - ✅ Performance: Process 10K records in < 5 minutes
 - ✅ Error handling with automatic rollback
-- ✅ Monitoring via Bull Board
 
 ### 17.3 Documentation Requirements
 
-- ✅ PRD document (this document)
+- ✅ PRD document
 - ✅ API documentation for services
 - ✅ Operational runbook
 - ✅ Migration guide
@@ -1518,36 +922,27 @@ For datasets > 100K records:
    - One-click cleanup with confirmation
 
 2. **Automated Scheduling**
-   - Cron job for periodic duplicate detection
-   - Automatic import from backup on schedule
+   - Cron-based CLI orchestration outside the core feature
    - Email notifications for cleanup recommendations
 
 3. **Advanced Analytics**
-   - Duplicate pattern analysis
-   - Root cause identification
-   - Trend reporting over time
+   - Duplicate-rate reporting by order cohort
+   - Cleanup trend analysis
 
-4. **Multi-Database Support**
+4. **Multi-Source Support**
    - Support multiple backup databases
-   - Parallel import from multiple sources
-   - Consolidated reporting
-
-5. **Data Archival**
-   - Archive cleaned duplicates to cold storage
-   - Implement retention policies
-   - Automated cleanup of old audit records
+   - Configurable source table mappings
 
 ---
 
 ## 19. Risks & Mitigation
 
-| Risk | Impact | Probability | Mitigation |
-|------|--------|-------------|------------|
-| Data loss during cleanup | High | Low | Dry-run mode, confirmation required, audit trail |
-| Backup DB connection failure | Medium | Medium | Graceful degradation, retry logic, timeout handling |
-| Performance degradation | Medium | Low | Batch processing, background jobs, connection pooling |
-| Migration conflicts | Low | Low | Timestamped migrations, thorough testing |
-| Incorrect duplicate identification | High | Low | Manual review process, dry-run validation |
+| Risk | Impact | Likelihood | Mitigation |
+|---|---|---|---|
+| Wrong backup source selected | High | Medium | Explicit `BACKUP_DATABASE_URL`, read-only credentials, validation queries |
+| Mirror-copy drift | High | Medium | Contract tests on source fields, especially `id` |
+| Unsafe destructive cleanup | High | Low | Dry-run-first flow, `--confirm`, logs |
+| Performance degradation | Medium | Low | Batch processing, CLI execution, connection pooling |
 
 ---
 
@@ -1555,93 +950,42 @@ For datasets > 100K records:
 
 ### 20.1 Special Order IDs Reference
 
-```typescript
-export const SPECIAL_ORDER_IDS = [
-  '7D01E25F-961C-F011-8B3D-6045BD8068CA',
-  '750A2CC5-0A22-F011-8B3D-6045BD8068CA',
-] as const;
-```
+- `7D01E25F-961C-F011-8B3D-6045BD8068CA`
+- `750A2CC5-0A22-F011-8B3D-6045BD8068CA`
 
 ### 20.2 Cleanup Status Enum
 
 ```typescript
-export enum CleanupStatus {
+enum CleanupStatus {
   PENDING = 'pending',
   CLEANED = 'cleaned',
   SKIPPED = 'skipped',
-  FAILED = 'failed',
 }
 ```
 
 ### 20.3 Sample Queries
 
-**Find all pending duplicates:**
 ```sql
-SELECT * FROM duplicate_order_kits
-WHERE cleanupStatus = 'pending'
-ORDER BY createdAt DESC;
-```
+SELECT COUNT(*) FROM duplicate_order_kits;
+SELECT COUNT(*) FROM special_duplicate_order_kits;
 
-**Count duplicates by order:**
-```sql
-SELECT orderId, COUNT(*) as duplicate_count
+SELECT TOP 50 *
 FROM duplicate_order_kits
-GROUP BY orderId
-HAVING COUNT(*) > 1
-ORDER BY duplicate_count DESC;
-```
-
-**Audit trail for cleaned records:**
-```sql
-SELECT
-  orderId,
-  kitId,
-  cleanedAt,
-  cleanupJobId,
-  notes
-FROM duplicate_order_kits
-WHERE cleanupStatus = 'cleaned'
-ORDER BY cleanedAt DESC;
+WHERE cleanupStatus = 'pending';
 ```
 
 ---
 
 ## 21. Glossary
 
-- **Audit Table**: A database table that stores historical records for tracking and compliance
-- **Backup Database**: A separate database containing backup/historical data
-- **Dry-Run**: A test execution that simulates an operation without making actual changes
-- **Destructive Operation**: An operation that permanently deletes or modifies data
-- **Migration**: A versioned database schema change
-- **Background Job**: An asynchronous task processed by a queue worker
-- **Batch Processing**: Processing data in chunks rather than all at once
-- **Idempotent**: An operation that produces the same result regardless of how many times it's executed
+- **Mirror Copy**: A main-database audit row whose source columns exactly match the backup `order-kits` row, including `id`
+- **Dry Run**: A non-mutating analysis of cleanup impact
+- **Special Duplicate**: A duplicate tied to one of the two special order IDs
 
 ---
 
 ## 22. References
 
-- [TypeORM Documentation](https://typeorm.io/)
-- [NestJS Documentation](https://docs.nestjs.com/)
-- [Bull Queue Documentation](https://github.com/OptimalBits/bull)
-- [SQL Server Best Practices](https://docs.microsoft.com/en-us/sql/relational-databases/)
-- [Vitract Platform Database Schema](../src/docs/platform/database-schema.md)
-
----
-
-**Document Version History**
-
-| Version | Date | Author | Changes |
-|---------|------|--------|---------|
-| 1.0 | 2026-03-04 | System Architecture Team | Initial PRD creation |
-
----
-
-**Approval Signatures**
-
-- [ ] Technical Lead: _________________ Date: _______
-- [ ] Product Manager: _________________ Date: _______
-- [ ] Database Administrator: _________________ Date: _______
-- [ ] Security Officer: _________________ Date: _______
-
-
+- Existing project CLI patterns
+- TypeORM MSSQL configuration
+- Internal duplicate-order-kit investigation artifacts
